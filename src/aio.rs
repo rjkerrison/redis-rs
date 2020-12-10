@@ -11,8 +11,9 @@ use combine::{parser::combinator::AnySendPartialState, stream::PointerOffset};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+use native_tls::TlsConnector;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
@@ -36,8 +37,10 @@ use crate::connection::{ConnectionAddr, ConnectionInfo};
 
 use crate::parser::ValueCodec;
 
+#[derive(Debug)]
 enum ActualConnection {
-    Tcp(TcpStream),
+    //Tcp(TcpStream),
+    Tcp(tokio_tls::TlsStream<TcpStream>),
     #[cfg(unix)]
     Unix(UnixStream),
 }
@@ -104,6 +107,8 @@ impl Connection {
 pub async fn connect(connection_info: &ConnectionInfo) -> RedisResult<Connection> {
     let con = connect_simple(connection_info).await?;
 
+    println!("con {:?}", &con);
+
     let mut rv = Connection {
         con,
         buf: Vec::new(),
@@ -161,9 +166,35 @@ async fn connect_simple(connection_info: &ConnectionInfo) -> RedisResult<ActualC
                 }
             };
 
-            TcpStream::connect(&socket_addr)
+            println!("host {}", &host);
+
+            let socket = TcpStream::connect(&socket_addr).await?;
+            let connector = TlsConnector::builder().build().map_err(
+                |e| io::Error::new(io::ErrorKind::Other, e),
+                //RedisError::from((ErrorKind::InvalidClientConfig, "Cannot connect by TLS")
+            )?;
+
+            println!("socket_addr {:?}", &socket_addr);
+
+            let connector = tokio_tls::TlsConnector::from(connector);
+            let mut tls_stream = connector.connect(&host.to_string(), socket).await.unwrap();
+
+            let _ = tls_stream.write_all(b"KEYS").await;
+
+            let mut data = String::new();
+            tls_stream.read_to_string(&mut data).await?;
+
+            println!("data {:?}", &data);
+
+            tokio_tls::TlsConnector::from(TlsConnector::builder().build().unwrap())
+                .connect(&host.to_string(), TcpStream::connect(&socket_addr).await?)
                 .await
-                .map(ActualConnection::Tcp)?
+                .map(ActualConnection::Tcp)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+
+            // TcpStream::connect(&socket_addr)
+            //     .await
+            //     .map(ActualConnection::Tcp)?
         }
 
         #[cfg(unix)]
@@ -210,6 +241,7 @@ impl ConnectionLike for Connection {
         (async move {
             self.buf.clear();
             cmd.write_packed_command(&mut self.buf);
+            println!("I'm writing to con! {:?}", &self.con);
             self.con.write_all(&self.buf).await?;
             self.read_response().await
         })
